@@ -19,6 +19,19 @@ MODES = {
     "tls": True
 }
 
+# Connection settings
+# CLIENT_KEEPALIVE = 150
+# CLIENT_HANDSHAKE_TIMEOUT = 25
+# CLIENT_ACK_TIMEOUT = 450
+# FAST_MODE = False
+# PREFER_IPV6 = False
+# USE_MIDDLE_PROXY = False
+
+# Protocol tag matching strategy
+# True:  New strategy - prioritize checking is_tls_handshake first (better for FAKETLS)
+# False: Legacy strategy - check proto_tag first (original C implementation)
+PRIORITIZE_TLS_TRANSPORT = True
+
 # The domain for TLS mode, bad clients are proxied there
 # Use random existing domain, proxy checks it on start
 # TLS_DOMAIN = "www.google.com"

@@ -197,6 +197,11 @@ def init_config():
 
     conf_dict["MODES"] = modes
 
+    # Protocol tag matching strategy
+    # True:  New strategy - prioritize checking is_tls_handshake first (better for FAKETLS)
+    # False: Legacy strategy - check proto_tag first (original C implementation)
+    conf_dict.setdefault("PRIORITIZE_TLS_TRANSPORT", False)
+
     # accept incoming connections only with proxy protocol v1/v2, useful for nginx and haproxy
     conf_dict.setdefault("PROXY_PROTOCOL", False)
 
@@ -1347,14 +1352,30 @@ async def handle_handshake(reader, writer):
             continue
 
         # Check mode compatibility based on transport layer (TLS or not) and proto_tag
-        if proto_tag == PROTO_TAG_SECURE:
-            if is_tls_handshake and not config.MODES["tls"]:
-                continue
-            if not is_tls_handshake and not config.MODES["secure"]:
-                continue
+        if config.PRIORITIZE_TLS_TRANSPORT:
+            # New strategy: prioritize TLS transport layer check first (better for FAKETLS)
+            if is_tls_handshake:
+                # TLS transport: allow if "tls" mode is enabled
+                if not config.MODES["tls"]:
+                    continue
+            else:
+                # Non-TLS transport: check based on proto_tag
+                if proto_tag == PROTO_TAG_SECURE:
+                    if not config.MODES["secure"]:
+                        continue
+                else:
+                    if not config.MODES["classic"]:
+                        continue
         else:
-            if not config.MODES["classic"]:
-                continue
+            # Legacy strategy: check proto_tag first (original C implementation)
+            if proto_tag == PROTO_TAG_SECURE:
+                if is_tls_handshake and not config.MODES["tls"]:
+                    continue
+                if not is_tls_handshake and not config.MODES["secure"]:
+                    continue
+            else:
+                if not config.MODES["classic"]:
+                    continue
 
         dc_idx = int.from_bytes(decrypted[DC_IDX_POS:DC_IDX_POS+2], "little", signed=True)
 
