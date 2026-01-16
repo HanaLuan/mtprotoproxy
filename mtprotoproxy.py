@@ -497,7 +497,7 @@ myrandom = MyRandom()
 
 
 class TgConnectionPool:
-    MAX_CONNS_IN_POOL = 4  # Reduced from 64 for debugging - prevents rate limiting
+    MAX_CONNS_IN_POOL = 1  # Reduced from 64 for debugging - prevents rate limiting
 
     def __init__(self):
         self.pools = {}
@@ -1347,27 +1347,14 @@ async def handle_handshake(reader, writer):
             continue
 
         # Check mode compatibility based on transport layer (TLS or not) and proto_tag
-        if is_tls_handshake:
-            # TLS transport: allow if "tls" mode is enabled
-            if not config.MODES["tls"]:
+        if proto_tag == PROTO_TAG_SECURE:
+            if is_tls_handshake and not config.MODES["tls"]:
+                continue
+            if not is_tls_handshake and not config.MODES["secure"]:
                 continue
         else:
-            # Non-TLS transport: check based on proto_tag
-            if proto_tag == PROTO_TAG_SECURE:
-                if not config.MODES["secure"]:
-                    continue
-            else:
-                if not config.MODES["classic"]:
-                    continue
-        # Original Code:
-        # if proto_tag == PROTO_TAG_SECURE:
-        #     if is_tls_handshake and not config.MODES["tls"]:
-        #         continue
-        #     if not is_tls_handshake and not config.MODES["secure"]:
-        #         continue
-        # else:
-        #     if not config.MODES["classic"]:
-        #         continue
+            if not config.MODES["classic"]:
+                continue
 
         dc_idx = int.from_bytes(decrypted[DC_IDX_POS:DC_IDX_POS+2], "little", signed=True)
 
@@ -1517,9 +1504,9 @@ async def middleproxy_handshake(host, port, reader_tgt, writer_tgt):
     await writer_tgt.drain()
 
     reader_tgt = MTProtoFrameStreamReader(reader_tgt, START_SEQ_NO)
-    debug_print(f"middleproxy_handshake: Waiting for RPC_NONCE response...")
+    debug_print(f"middleproxy_handshake: Waiting for RPC_NONCE response, seq_no={reader_tgt.seq_no}...")
     ans = await reader_tgt.read(get_to_clt_bufsize())
-    debug_print(f"middleproxy_handshake: Got RPC_NONCE response, len={len(ans)}")
+    debug_print(f"middleproxy_handshake: Got RPC_NONCE response, len={len(ans)}, next_seq_no={reader_tgt.seq_no}")
 
     if len(ans) != RPC_NONCE_ANS_LEN:
         debug_print(f"middleproxy_handshake: ERROR - bad RPC_NONCE response length: {len(ans)}")
@@ -1578,39 +1565,81 @@ async def middleproxy_handshake(host, port, reader_tgt, writer_tgt):
     decryptor = create_aes_cbc(key=dec_key, iv=dec_iv)
     debug_print(f"middleproxy_handshake: AES keys computed, enc_key={enc_key.hex()[:32]}...")
 
+    # Fixed PIDs for RPC_HANDSHAKE protocol
+    # Telegram's RPC protocol expects exactly 12 bytes for SENDER_PID and PEER_PID
+    # Both should be "IPIPPRPDTIME" (representing process identifier)
     SENDER_PID = b"IPIPPRPDTIME"
     PEER_PID = b"IPIPPRPDTIME"
 
     # Phase 2: RPC_HANDSHAKE - encrypted, padding required
     handshake = RPC_HANDSHAKE + RPC_FLAGS + SENDER_PID + PEER_PID
-    debug_print(f"middleproxy_handshake: Sending RPC_HANDSHAKE (encrypted), handshake_hex={handshake.hex()}")
+    debug_print(f"middleproxy_handshake: Sending RPC_HANDSHAKE (encrypted)")
+    debug_print(f"  RPC_HANDSHAKE: {RPC_HANDSHAKE.hex()}")
+    debug_print(f"  RPC_FLAGS: {RPC_FLAGS.hex()}")
+    debug_print(f"  SENDER_PID ({len(SENDER_PID)} bytes): {SENDER_PID.hex()}")
+    debug_print(f"  PEER_PID ({len(PEER_PID)} bytes): {PEER_PID.hex()}")
+    debug_print(f"  Total handshake len: {len(handshake)}, hex={handshake.hex()}")
 
     # Wrap writer upstream with crypto for writing
     writer_tgt.upstream = CryptoWrappedStreamWriter(writer_tgt.upstream, encryptor, block_size=16)
     writer_tgt.add_padding = True  # Enable CBC padding for encrypted phase
+    debug_print(f"middleproxy_handshake: About to write handshake, writer seq_no={writer_tgt.seq_no}")
     writer_tgt.write(handshake)
     await writer_tgt.drain()
-    debug_print(f"middleproxy_handshake: RPC_HANDSHAKE sent successfully")
+    debug_print(f"middleproxy_handshake: RPC_HANDSHAKE sent successfully, writer seq_no={writer_tgt.seq_no}")
 
     # Wrap reader upstream with crypto for reading
-    # Key: use reader_tgt.upstream (the original StreamReader), not writer's upstream
+    # Create a fresh reader for Phase 2 that handles the encrypted stream properly
+    # The response is: [len:4][seq:4][data:N][crc:4] all encrypted
+    debug_print(f"middleproxy_handshake: Phase 2 - Setting up decryption, expecting seq_no={reader_tgt.seq_no}")
+    
+    # We need to wrap the underlying reader_tgt.upstream directly with crypto
+    # Then create a new framed reader on top of it
     crypto_reader = CryptoWrappedStreamReader(reader_tgt.upstream, decryptor, block_size=16)
+    
+    # Create a new frame reader with the correct sequence number for Phase 2
+    # The seq_no from Phase 1 should be correct here (-1 after reading RPC_NONCE response)
     reader_tgt_phase2 = MTProtoFrameStreamReader(crypto_reader, reader_tgt.seq_no)
 
     debug_print(f"middleproxy_handshake: Waiting for RPC_HANDSHAKE response...")
-    handshake_ans = await reader_tgt_phase2.read(1)
-    debug_print(f"middleproxy_handshake: Got RPC_HANDSHAKE response, len={len(handshake_ans)}")
+    try:
+        handshake_ans = await reader_tgt_phase2.read(get_to_clt_bufsize())
+    except asyncio.IncompleteReadError as e:
+        debug_print(f"middleproxy_handshake: ERROR - Server closed connection without sending response")
+        debug_print(f"middleproxy_handshake: Expected {e.expected} bytes, got {len(e.partial)}")
+        debug_print(f"middleproxy_handshake: Partial data: {e.partial.hex() if e.partial else 'NONE'}")
+        raise ConnectionAbortedError(f"server closed connection: {e}")
+    except Exception as e:
+        debug_print(f"middleproxy_handshake: ERROR reading handshake response: {type(e).__name__}: {e}")
+        raise ConnectionAbortedError(f"error reading handshake response: {e}")
     
+    debug_print(f"middleproxy_handshake: Got RPC_HANDSHAKE response, len={len(handshake_ans)}")
     
     if len(handshake_ans) != RPC_HANDSHAKE_ANS_LEN:
         debug_print(f"middleproxy_handshake: ERROR - bad RPC_HANDSHAKE response length: {len(handshake_ans)}")
+        # Check if it is an error packet
+        if len(handshake_ans) >= 8:
+             ans_type = handshake_ans[:4]
+             if ans_type == b"\x08\x57\x60\xd4": # RPC_HANDSHAKE_ERROR
+                  err_code = int.from_bytes(handshake_ans[4:8], "little", signed=True)
+                  debug_print(f"middleproxy_handshake: RPC_HANDSHAKE_ERROR code={err_code}")
+                  raise ConnectionAbortedError(f"rpc handshake error {err_code}")
+
         raise ConnectionAbortedError("bad rpc handshake answer length")
 
-    handshake_type, handshake_flags, handshake_sender_pid, handshake_peer_pid = (
-        handshake_ans[:4], handshake_ans[4:8], handshake_ans[8:20], handshake_ans[20:32])
-    if handshake_type != RPC_HANDSHAKE or handshake_peer_pid != SENDER_PID:
-        debug_print(f"middleproxy_handshake: ERROR - bad RPC_HANDSHAKE answer: type={handshake_type.hex()}, peer_pid={handshake_peer_pid.hex()}")
-        raise ConnectionAbortedError("bad rpc handshake answer")
+    # Parse response: RPC_HANDSHAKE(4) + FLAGS(4) + SERVER_PID(12) + CLIENT_PID(12) = 32 bytes
+    handshake_type = handshake_ans[:4]
+    handshake_flags = handshake_ans[4:8]
+    handshake_sender_pid = handshake_ans[8:20]  # Server's PID
+    handshake_peer_pid = handshake_ans[20:32]   # Echo back of our PID
+    
+    if handshake_type != RPC_HANDSHAKE:
+        debug_print(f"middleproxy_handshake: ERROR - bad RPC_HANDSHAKE response type: {handshake_type.hex()}")
+        raise ConnectionAbortedError("bad rpc handshake response type")
+    
+    if handshake_peer_pid != SENDER_PID:
+        debug_print(f"middleproxy_handshake: ERROR - bad RPC_HANDSHAKE peer_pid: expected {SENDER_PID.hex()}, got {handshake_peer_pid.hex()}")
+        raise ConnectionAbortedError("bad rpc handshake peer_pid")
 
     debug_print(f"middleproxy_handshake: SUCCESS! Server PID={handshake_sender_pid.hex()}")
     
