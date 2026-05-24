@@ -1554,7 +1554,16 @@ async def do_direct_handshake(proto_tag, dc_idx, dec_key_and_iv=None):
 
 def is_good_rpc_dh_value(value):
     data = value.to_bytes(256, "big")
-    return any(data[:8]) and value < RPC_DH_PRIME
+    if not any(data[:8]):
+        return False
+
+    prime_data = RPC_DH_PRIME.to_bytes(256, "big")
+    for i in range(8):
+        if data[i] > prime_data[i]:
+            return False
+        if data[i] < prime_data[i]:
+            return True
+    return False
 
 
 def create_rpc_dh_public_value():
