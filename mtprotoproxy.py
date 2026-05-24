@@ -19,6 +19,7 @@ import signal
 import os
 import stat
 import traceback
+import warnings
 
 
 TG_DATACENTER_PORT = 443
@@ -79,6 +80,27 @@ MAX_MSG_LEN = 2 ** 24
 
 STAT_DURATION_BUCKETS = [0.1, 0.5, 1, 2, 5, 15, 60, 300, 600, 1800, 2**31 - 1]
 
+RPC_DH_GEN = 3
+RPC_PARAM_HASH = 0x00620b93
+RPC_DH_PRIME = int.from_bytes(bytes.fromhex(
+    "8952131b1e3a69ba5f85cf8bd266c12b13831613bd2a4ef835a4d53f9dbb4248"
+    "2dbd462b31d86c816c5977520f1170739ed2ddd6d81b9eb65faaac148753c9e4"
+    "f072dc11a492730683fa0067826b18c51d7ecba52b826075c0b955e5acafdd74"
+    "c3795fd9520b480f3be3ba0665338a498ca5daf101760509a38c49e300746408"
+    "774bb3ed26181a6455766ae9497bb9c3a3ad5cbaf76b73845fbb96bb6d0f684f"
+    "95d2d39ccbb4a904fab1de4349ce1c2087b6c951ed99f952e34fd1a3fd148335"
+    "75414729a38be868a4f9ec623a5d24621aba01b255c7e8385d16ac93b02d2a54"
+    "0a7642982d22ada3ccde5c8d266faa25dd2de9f6d49104162f685c45fe34ddab"
+), "big")
+
+# Debug flag for middleproxy diagnostics
+DEBUG_MIDDLEPROXY = True
+
+def debug_print(*args, **kwargs):
+    """Print debug messages if DEBUG_MIDDLEPROXY is enabled"""
+    if DEBUG_MIDDLEPROXY:
+        print("[DEBUG]", *args, file=sys.stderr, flush=True, **kwargs)
+
 my_ip_info = {"ipv4": None, "ipv6": None}
 used_handshakes = collections.OrderedDict()
 client_ips = collections.OrderedDict()
@@ -91,11 +113,27 @@ last_clients_with_time_skew = {}
 last_clients_with_same_handshake = collections.Counter()
 proxy_start_time = 0
 proxy_links = []
+middle_proxy_stack_failures = collections.Counter()
+middle_proxy_stack_dead_until = {}
 
 stats = collections.Counter()
 user_stats = collections.defaultdict(collections.Counter)
 
 config = {}
+
+
+def mark_middle_proxy_stack_failure(family):
+    if not config.DIFFERENT_IPSTACK_RETRY:
+        return
+
+    middle_proxy_stack_failures[family] += 1
+    failures = middle_proxy_stack_failures[family]
+    debug_print(f"do_middleproxy_handshake: {family} middle proxy stack failure count={failures}/{config.DIFFERENT_IPSTACK_RETRY_THRESHOLD}")
+    if failures >= config.DIFFERENT_IPSTACK_RETRY_THRESHOLD:
+        dead_until = time.time() + config.MARK_DEATH_TIME
+        middle_proxy_stack_dead_until[family] = dead_until
+        middle_proxy_stack_failures[family] = 0
+        debug_print(f"do_middleproxy_handshake: Marked {family} middle proxy stack dead for {config.MARK_DEATH_TIME}s after {failures} failures")
 
 
 def init_config():
@@ -139,8 +177,8 @@ def init_config():
     # use middle proxy, necessary to show ad
     conf_dict.setdefault("USE_MIDDLE_PROXY", len(conf_dict["AD_TAG"]) == 16)
 
-    # if IPv6 available, use it by default, IPv6 with middle proxies is unstable now
-    conf_dict.setdefault("PREFER_IPV6", socket.has_ipv6 and not conf_dict["USE_MIDDLE_PROXY"])
+    # if IPv6 available, use it by default
+    conf_dict.setdefault("PREFER_IPV6", socket.has_ipv6)
 
     # disables tg->client traffic reencryption, faster but less secure
     conf_dict.setdefault("FAST_MODE", True)
@@ -182,6 +220,11 @@ def init_config():
         print_err("}")
 
     conf_dict["MODES"] = modes
+
+    # Protocol tag matching strategy
+    # True:  New strategy - prioritize checking is_tls_handshake first (better for FAKETLS)
+    # False: Legacy strategy - check proto_tag first (original C implementation)
+    conf_dict.setdefault("PRIORITIZE_TLS_TRANSPORT", False)
 
     # accept incoming connections only with proxy protocol v1/v2, useful for nginx and haproxy
     conf_dict.setdefault("PROXY_PROTOCOL", False)
@@ -239,6 +282,11 @@ def init_config():
     # delay in seconds between middle proxy info updates
     conf_dict.setdefault("PROXY_INFO_UPDATE_PERIOD", 24*60*60)
 
+    # if one IP stack repeatedly times out for middle proxies, temporarily try the other stack first
+    conf_dict.setdefault("DIFFERENT_IPSTACK_RETRY", True)
+    conf_dict.setdefault("DIFFERENT_IPSTACK_RETRY_THRESHOLD", 8)
+    conf_dict.setdefault("MARK_DEATH_TIME", 300)
+
     # delay in seconds between time getting, zero means disabled
     conf_dict.setdefault("GET_TIME_PERIOD", 10*60)
 
@@ -263,6 +311,10 @@ def init_config():
 
     # telegram servers connect timeout in seconds
     conf_dict.setdefault("TG_CONNECT_TIMEOUT", 10)
+
+    # max pre-opened connections per Telegram host/port in the direct connection pool
+    conf_dict.setdefault("TG_MAX_CONNS_IN_POOL", TgConnectionPool.DEFAULT_MAX_CONNS_IN_POOL)
+    conf_dict["TG_MAX_CONNS_IN_POOL"] = max(0, int(conf_dict["TG_MAX_CONNS_IN_POOL"]))
 
     # drop connection if no data from telegram server for this many seconds
     conf_dict.setdefault("TG_READ_TIMEOUT", 60)
@@ -486,21 +538,26 @@ myrandom = MyRandom()
 
 
 class TgConnectionPool:
-    MAX_CONNS_IN_POOL = 16
+    DEFAULT_MAX_CONNS_IN_POOL = 16
 
     def __init__(self):
         self.pools = {}
 
     async def open_tg_connection(self, host, port, init_func=None):
+        debug_print(f"TgConnectionPool.open_tg_connection: Connecting to {host}:{port}")
         task = asyncio.open_connection(host, port, limit=get_to_clt_bufsize())
         reader_tgt, writer_tgt = await asyncio.wait_for(task, timeout=config.TG_CONNECT_TIMEOUT)
+        debug_print(f"TgConnectionPool.open_tg_connection: TCP connected to {host}:{port}")
 
         set_keepalive(writer_tgt.get_extra_info("socket"))
         set_bufsizes(writer_tgt.get_extra_info("socket"), get_to_clt_bufsize(), get_to_tg_bufsize())
 
         if init_func:
-            return await asyncio.wait_for(init_func(host, port, reader_tgt, writer_tgt),
+            debug_print(f"TgConnectionPool.open_tg_connection: Running init_func for {host}:{port}")
+            result = await asyncio.wait_for(init_func(host, port, reader_tgt, writer_tgt),
                                           timeout=config.TG_CONNECT_TIMEOUT)
+            debug_print(f"TgConnectionPool.open_tg_connection: init_func completed for {host}:{port}")
+            return result
         return reader_tgt, writer_tgt
 
     def is_conn_dead(self, reader, writer):
@@ -517,33 +574,58 @@ class TgConnectionPool:
         if (host, port, init_func) not in self.pools:
             self.pools[(host, port, init_func)] = []
 
-        while len(self.pools[(host, port, init_func)]) < TgConnectionPool.MAX_CONNS_IN_POOL:
+        current_count = len(self.pools[(host, port, init_func)])
+        new_tasks = 0
+        while len(self.pools[(host, port, init_func)]) < config.TG_MAX_CONNS_IN_POOL:
             connect_task = asyncio.ensure_future(self.open_tg_connection(host, port, init_func))
             self.pools[(host, port, init_func)].append(connect_task)
+            new_tasks += 1
+        
+        if new_tasks > 0:
+            debug_print(f"TgConnectionPool.register_host_port: {host}:{port} - added {new_tasks} tasks (current: {current_count} -> {len(self.pools[(host, port, init_func)])})")
 
     async def get_connection(self, host, port, init_func=None):
+        if init_func:
+            return await self.open_tg_connection(host, port, init_func)
+
+        pool_key = (host, port, init_func)
         self.register_host_port(host, port, init_func)
 
         ret = None
-        for task in self.pools[(host, port, init_func)][:]:
+        for task in self.pools[pool_key][::]:
             if task.done():
                 if task.exception():
-                    self.pools[(host, port, init_func)].remove(task)
+                    self.pools[pool_key].remove(task)
                     continue
 
                 reader, writer, *other = task.result()
                 if self.is_conn_dead(reader, writer):
-                    self.pools[(host, port, init_func)].remove(task)
+                    self.pools[pool_key].remove(task)
                     writer.transport.abort()
                     continue
 
                 if not ret:
-                    self.pools[(host, port, init_func)].remove(task)
+                    self.pools[pool_key].remove(task)
                     ret = (reader, writer, *other)
 
         self.register_host_port(host, port, init_func)
         if ret:
             return ret
+
+        if self.pools[pool_key]:
+            task = self.pools[pool_key][0]
+            try:
+                ret = await task
+            finally:
+                if task in self.pools[pool_key]:
+                    self.pools[pool_key].remove(task)
+
+            self.register_host_port(host, port, init_func)
+            reader, writer, *other = ret
+            if not self.is_conn_dead(reader, writer):
+                return ret
+            writer.transport.abort()
+
         return await self.open_tg_connection(host, port, init_func)
 
 
@@ -697,11 +779,13 @@ class CryptoWrappedStreamWriter(LayeredStreamWriterBase):
         self.block_size = block_size
 
     def write(self, data, extra={}):
+        debug_print(f"CryptoWrappedStreamWriter.write: data_len={len(data)}, block_size={self.block_size}, aligned={len(data) % self.block_size == 0}")
         if len(data) % self.block_size != 0:
             print_err("BUG: writing %d bytes not aligned to block size %d" % (
                       len(data), self.block_size))
             return 0
         q = self.encryptor.encrypt(data)
+        debug_print(f"CryptoWrappedStreamWriter.write: encrypted_len={len(q)}")
         return self.upstream.write(q)
 
 
@@ -744,11 +828,12 @@ class MTProtoFrameStreamReader(LayeredStreamReaderBase):
 
 
 class MTProtoFrameStreamWriter(LayeredStreamWriterBase):
-    __slots__ = ('seq_no', )
+    __slots__ = ('seq_no', 'add_padding')
 
-    def __init__(self, upstream, seq_no=0):
+    def __init__(self, upstream, seq_no=0, add_padding=False):
         self.upstream = upstream
         self.seq_no = seq_no
+        self.add_padding = add_padding
 
     def write(self, msg, extra={}):
         len_bytes = int.to_bytes(len(msg) + 4 + 4 + 4, 4, "little")
@@ -759,9 +844,19 @@ class MTProtoFrameStreamWriter(LayeredStreamWriterBase):
         checksum = int.to_bytes(binascii.crc32(msg_without_checksum), 4, "little")
 
         full_msg = msg_without_checksum + checksum
-        padding = PADDING_FILLER * ((-len(full_msg) % CBC_PADDING) // len(PADDING_FILLER))
-
-        return self.upstream.write(full_msg + padding)
+        
+        # Only add CBC padding when in encrypted mode
+        if self.add_padding:
+            padding = PADDING_FILLER * ((-len(full_msg) % CBC_PADDING) // len(PADDING_FILLER))
+            final_msg = full_msg + padding
+        else:
+            padding = b""
+            final_msg = full_msg
+        
+        debug_print(f"MTProtoFrameStreamWriter.write: msg_len={len(msg)}, frame_len={len(full_msg)}, padding_len={len(padding)}, final_len={len(final_msg)}, seq={self.seq_no - 1}, add_padding={self.add_padding}")
+        debug_print(f"MTProtoFrameStreamWriter.write: FRAME_HEX={final_msg.hex()}")
+        
+        return self.upstream.write(final_msg)
 
 
 class MTProtoCompactFrameStreamReader(LayeredStreamReaderBase):
@@ -969,6 +1064,8 @@ class ProxyReqStreamWriter(LayeredStreamWriterBase):
         full_msg += self.remote_ip_port + self.our_ip_port + EXTRA_SIZE + PROXY_TAG
         full_msg += bytes([len(config.AD_TAG)]) + config.AD_TAG + FOUR_BYTES_ALIGNER
         full_msg += msg
+
+        debug_print(f"ProxyReqStreamWriter.write: flags=0x{flags:08x}, proto_tag={self.proto_tag.hex()}, AD_TAG len={len(config.AD_TAG)}, msg_len={len(msg)}, total_len={len(full_msg)}")
 
         return self.upstream.write(full_msg)
 
@@ -1320,14 +1417,31 @@ async def handle_handshake(reader, writer):
         if proto_tag not in (PROTO_TAG_ABRIDGED, PROTO_TAG_INTERMEDIATE, PROTO_TAG_SECURE):
             continue
 
-        if proto_tag == PROTO_TAG_SECURE:
-            if is_tls_handshake and not config.MODES["tls"]:
-                continue
-            if not is_tls_handshake and not config.MODES["secure"]:
-                continue
+        # Check mode compatibility based on transport layer (TLS or not) and proto_tag
+        if config.PRIORITIZE_TLS_TRANSPORT:
+            # New strategy: prioritize TLS transport layer check first (better for FAKETLS)
+            if is_tls_handshake:
+                # TLS transport: allow if "tls" mode is enabled
+                if not config.MODES["tls"]:
+                    continue
+            else:
+                # Non-TLS transport: check based on proto_tag
+                if proto_tag == PROTO_TAG_SECURE:
+                    if not config.MODES["secure"]:
+                        continue
+                else:
+                    if not config.MODES["classic"]:
+                        continue
         else:
-            if not config.MODES["classic"]:
-                continue
+            # Legacy strategy: check proto_tag first (original C implementation)
+            if proto_tag == PROTO_TAG_SECURE:
+                if is_tls_handshake and not config.MODES["tls"]:
+                    continue
+                if not is_tls_handshake and not config.MODES["secure"]:
+                    continue
+            else:
+                if not config.MODES["classic"]:
+                    continue
 
         dc_idx = int.from_bytes(decrypted[DC_IDX_POS:DC_IDX_POS+2], "little", signed=True)
 
@@ -1420,9 +1534,43 @@ async def do_direct_handshake(proto_tag, dc_idx, dec_key_and_iv=None):
     return reader_tgt, writer_tgt
 
 
+def is_good_rpc_dh_value(value):
+    data = value.to_bytes(256, "big")
+    return any(data[:8]) and value < RPC_DH_PRIME
+
+
+def create_rpc_dh_public_value():
+    while True:
+        private_value = int.from_bytes(os.urandom(256), "big")
+        public_value = pow(RPC_DH_GEN, private_value, RPC_DH_PRIME)
+        if is_good_rpc_dh_value(public_value):
+            return private_value, public_value.to_bytes(256, "big")
+
+
+def compute_rpc_dh_shared_key(peer_public_bytes, private_value):
+    peer_public_value = int.from_bytes(peer_public_bytes, "big")
+    if not is_good_rpc_dh_value(peer_public_value):
+        raise ConnectionAbortedError("bad rpc dh public value")
+
+    shared_value = pow(peer_public_value, private_value, RPC_DH_PRIME)
+    return shared_value.to_bytes(256, "big")
+
+
+def build_rpc_process_id(ip=None, port=0, pid=0, utime=0):
+    ip_value = 0
+    if ip and ":" not in ip:
+        ip_value = int.from_bytes(socket.inet_pton(socket.AF_INET, ip), "big")
+    return (
+        int.to_bytes(ip_value, 4, "little") +
+        int.to_bytes(port, 2, "little", signed=True) +
+        int.to_bytes(pid, 2, "little") +
+        int.to_bytes(utime, 4, "little", signed=True)
+    )
+
+
 def get_middleproxy_aes_key_and_iv(nonce_srv, nonce_clt, clt_ts, srv_ip, clt_port, purpose,
                                    clt_ip, srv_port, middleproxy_secret, clt_ipv6=None,
-                                   srv_ipv6=None):
+                                   srv_ipv6=None, temp_key=b""):
     EMPTY_IP = b"\x00\x00\x00\x00"
 
     if not clt_ip or not srv_ip:
@@ -1438,6 +1586,13 @@ def get_middleproxy_aes_key_and_iv(nonce_srv, nonce_clt, clt_ts, srv_ip, clt_por
 
     s += nonce_clt
 
+    if temp_key:
+        first_len = min(len(s), len(temp_key))
+        for i in range(first_len):
+            s[i] ^= temp_key[i]
+        if len(s) < len(temp_key):
+            s += temp_key[len(s):]
+
     md5_sum = hashlib.md5(s[1:]).digest()
     sha1_sum = hashlib.sha1(s).digest()
 
@@ -1448,6 +1603,8 @@ def get_middleproxy_aes_key_and_iv(nonce_srv, nonce_clt, clt_ts, srv_ip, clt_por
 
 async def middleproxy_handshake(host, port, reader_tgt, writer_tgt):
     """ The most logic of middleproxy handshake, launched in pool """
+    debug_print(f"middleproxy_handshake: Starting handshake with {host}:{port}")
+    
     START_SEQ_NO = -2
     NONCE_LEN = 16
 
@@ -1456,33 +1613,87 @@ async def middleproxy_handshake(host, port, reader_tgt, writer_tgt):
     # pass as consts to simplify code
     RPC_FLAGS = b"\x00\x00\x00\x00"
     CRYPTO_AES = b"\x01\x00\x00\x00"
+    CRYPTO_AES_DH = b"\x03\x00\x00\x00"
 
-    RPC_NONCE_ANS_LEN = 32
+    RPC_NONCE_AES_LEN = 32
+    RPC_NONCE_AES_DH_LEN = 296
     RPC_HANDSHAKE_ANS_LEN = 32
 
-    writer_tgt = MTProtoFrameStreamWriter(writer_tgt, START_SEQ_NO)
+    # Phase 1: RPC_NONCE - plaintext, no padding needed
+    writer_tgt = MTProtoFrameStreamWriter(writer_tgt, START_SEQ_NO, add_padding=False)
     key_selector = PROXY_SECRET[:4]
     crypto_ts = int.to_bytes(int(time.time()) % (256**4), 4, "little")
 
     nonce = myrandom.getrandbytes(NONCE_LEN)
+    dh_private = None
 
     msg = RPC_NONCE + key_selector + CRYPTO_AES + crypto_ts + nonce
+    debug_print(f"middleproxy_handshake: Sending RPC_NONCE AES, key_selector={key_selector.hex()}, len={len(msg)}")
+    debug_print(f"middleproxy_handshake: PROXY_SECRET[0:8]={PROXY_SECRET[:8].hex()}")
 
     writer_tgt.write(msg)
     await writer_tgt.drain()
 
     reader_tgt = MTProtoFrameStreamReader(reader_tgt, START_SEQ_NO)
-    ans = await reader_tgt.read(get_to_clt_bufsize())
+    debug_print(f"middleproxy_handshake: Waiting for RPC_NONCE response, seq_no={reader_tgt.seq_no}...")
+    
+    try:
+        ans = await reader_tgt.read(get_to_clt_bufsize())
+        debug_print(f"middleproxy_handshake: Got RPC_NONCE response, len={len(ans)}, next_seq_no={reader_tgt.seq_no}")
+        if not ans:
+            debug_print("middleproxy_handshake: ERROR - empty RPC_NONCE response")
+            raise ConnectionAbortedError("empty rpc nonce response")
+    except asyncio.IncompleteReadError as e:
+        debug_print(f"middleproxy_handshake: ERROR reading RPC_NONCE response: IncompleteReadError expected={e.expected}, got={len(e.partial)}")
+        debug_print(f"middleproxy_handshake: RPC_NONCE partial data: {e.partial.hex() if e.partial else 'NONE'}")
+        raise ConnectionAbortedError(f"Middle Proxy {host}:{port} closed connection during nonce") from e
+    except asyncio.TimeoutError as e:
+        debug_print(f"middleproxy_handshake: ERROR reading RPC_NONCE response: timeout after {config.TG_CONNECT_TIMEOUT}s")
+        raise
+    except Exception as e:
+        debug_print(f"middleproxy_handshake: ERROR reading RPC_NONCE response: {type(e).__name__}: {e}")
+        debug_print(f"middleproxy_handshake: This usually means Middle Proxy rejected the connection")
+        debug_print(f"middleproxy_handshake: Possible causes:")
+        debug_print(f"  1. PROXY_SECRET is incorrect or outdated")
+        debug_print(f"  2. Middle Proxy address {host}:{port} is no longer valid")
+        debug_print(f"  3. Network issue or firewall blocking the connection")
+        raise ConnectionAbortedError(f"Middle Proxy {host}:{port} closed connection immediately") from e
 
-    if len(ans) != RPC_NONCE_ANS_LEN:
+    if len(ans) not in (RPC_NONCE_AES_LEN, RPC_NONCE_AES_DH_LEN):
+        debug_print(f"middleproxy_handshake: ERROR - bad RPC_NONCE response length: {len(ans)}")
         raise ConnectionAbortedError("bad rpc answer length")
 
     rpc_type, rpc_key_selector, rpc_schema, rpc_crypto_ts, rpc_nonce = (
         ans[:4], ans[4:8], ans[8:12], ans[12:16], ans[16:32]
     )
 
-    if rpc_type != RPC_NONCE or rpc_key_selector != key_selector or rpc_schema != CRYPTO_AES:
+    if rpc_type != RPC_NONCE or rpc_key_selector != key_selector or rpc_schema not in (CRYPTO_AES, CRYPTO_AES_DH):
+        debug_print(f"middleproxy_handshake: ERROR - bad RPC_NONCE answer: type={rpc_type.hex()}, key_sel={rpc_key_selector.hex()}, schema={rpc_schema.hex()}")
         raise ConnectionAbortedError("bad rpc answer")
+
+    if rpc_schema == CRYPTO_AES_DH:
+        if dh_private is None:
+            debug_print("middleproxy_handshake: ERROR - server returned AES_DH for non-DH nonce request")
+            raise ConnectionAbortedError("unexpected rpc dh answer")
+
+        if len(ans) != RPC_NONCE_AES_DH_LEN:
+            debug_print(f"middleproxy_handshake: ERROR - AES_DH schema with bad response length: {len(ans)}")
+            raise ConnectionAbortedError("bad rpc dh answer length")
+
+        extra_keys_count = int.from_bytes(ans[32:36], "little", signed=True)
+        ans_dh_params_select = int.from_bytes(ans[36:40], "little")
+        if extra_keys_count != 0 or ans_dh_params_select != RPC_PARAM_HASH:
+            debug_print(f"middleproxy_handshake: ERROR - bad DH params: extra_keys={extra_keys_count}, dh_select={ans_dh_params_select:08x}")
+            raise ConnectionAbortedError("bad rpc dh params")
+
+        dh_shared_key = compute_rpc_dh_shared_key(ans[40:296], dh_private)
+    else:
+        if len(ans) != RPC_NONCE_AES_LEN:
+            debug_print(f"middleproxy_handshake: ERROR - AES schema with bad response length: {len(ans)}")
+            raise ConnectionAbortedError("bad rpc aes answer length")
+        dh_shared_key = b""
+    
+    debug_print(f"middleproxy_handshake: RPC_NONCE AES_DH exchange successful")
 
     # get keys
     tg_ip, tg_port = writer_tgt.upstream.get_extra_info('peername')[:2]
@@ -1516,66 +1727,185 @@ async def middleproxy_handshake(host, port, reader_tgt, writer_tgt):
     enc_key, enc_iv = get_middleproxy_aes_key_and_iv(
         nonce_srv=rpc_nonce, nonce_clt=nonce, clt_ts=crypto_ts, srv_ip=tg_ip_bytes,
         clt_port=my_port_bytes, purpose=b"CLIENT", clt_ip=my_ip_bytes, srv_port=tg_port_bytes,
-        middleproxy_secret=PROXY_SECRET, clt_ipv6=my_ipv6_bytes, srv_ipv6=tg_ipv6_bytes)
+        middleproxy_secret=PROXY_SECRET, clt_ipv6=my_ipv6_bytes, srv_ipv6=tg_ipv6_bytes,
+        temp_key=dh_shared_key)
 
     dec_key, dec_iv = get_middleproxy_aes_key_and_iv(
         nonce_srv=rpc_nonce, nonce_clt=nonce, clt_ts=crypto_ts, srv_ip=tg_ip_bytes,
         clt_port=my_port_bytes, purpose=b"SERVER", clt_ip=my_ip_bytes, srv_port=tg_port_bytes,
-        middleproxy_secret=PROXY_SECRET, clt_ipv6=my_ipv6_bytes, srv_ipv6=tg_ipv6_bytes)
+        middleproxy_secret=PROXY_SECRET, clt_ipv6=my_ipv6_bytes, srv_ipv6=tg_ipv6_bytes,
+        temp_key=dh_shared_key)
 
     encryptor = create_aes_cbc(key=enc_key, iv=enc_iv)
     decryptor = create_aes_cbc(key=dec_key, iv=dec_iv)
+    debug_print(f"middleproxy_handshake: AES keys computed, enc_key={enc_key.hex()[:32]}...")
 
-    SENDER_PID = b"IPIPPRPDTIME"
-    PEER_PID = b"IPIPPRPDTIME"
+    # Match upstream struct process_id: ip:uint32, port:int16, pid:uint16, utime:int32.
+    SENDER_PID = build_rpc_process_id(my_ip, 0, os.getpid() & 0xffff, int(time.time()))
+    PEER_PID = build_rpc_process_id(tg_ip, tg_port)
 
-    # TODO: pass client ip and port here for statistics
+    # Phase 2: RPC_HANDSHAKE - encrypted, padding required
     handshake = RPC_HANDSHAKE + RPC_FLAGS + SENDER_PID + PEER_PID
+    debug_print(f"middleproxy_handshake: Sending RPC_HANDSHAKE (encrypted)")
+    debug_print(f"  RPC_HANDSHAKE: {RPC_HANDSHAKE.hex()}")
+    debug_print(f"  RPC_FLAGS: {RPC_FLAGS.hex()}")
+    debug_print(f"  SENDER_PID ({len(SENDER_PID)} bytes): {SENDER_PID.hex()}")
+    debug_print(f"  PEER_PID ({len(PEER_PID)} bytes): {PEER_PID.hex()}")
+    debug_print(f"  Total handshake len: {len(handshake)}, hex={handshake.hex()}")
 
+    # Wrap writer upstream with crypto for writing
     writer_tgt.upstream = CryptoWrappedStreamWriter(writer_tgt.upstream, encryptor, block_size=16)
+    writer_tgt.add_padding = True  # Enable CBC padding for encrypted phase
+    debug_print(f"middleproxy_handshake: About to write handshake, writer seq_no={writer_tgt.seq_no}")
     writer_tgt.write(handshake)
     await writer_tgt.drain()
+    debug_print(f"middleproxy_handshake: RPC_HANDSHAKE sent successfully, writer seq_no={writer_tgt.seq_no}")
 
-    reader_tgt.upstream = CryptoWrappedStreamReader(reader_tgt.upstream, decryptor, block_size=16)
+    # Wrap reader upstream with crypto for reading
+    # Create a fresh reader for Phase 2 that handles the encrypted stream properly
+    # The response is: [len:4][seq:4][data:N][crc:4] all encrypted
+    debug_print(f"middleproxy_handshake: Phase 2 - Setting up decryption, expecting seq_no={reader_tgt.seq_no}")
+    
+    # We need to wrap the underlying reader_tgt.upstream directly with crypto
+    # Then create a new framed reader on top of it
+    crypto_reader = CryptoWrappedStreamReader(reader_tgt.upstream, decryptor, block_size=16)
+    
+    # Create a new frame reader with the correct sequence number for Phase 2
+    # The seq_no from Phase 1 should be correct here (-1 after reading RPC_NONCE response)
+    reader_tgt_phase2 = MTProtoFrameStreamReader(crypto_reader, reader_tgt.seq_no)
 
-    handshake_ans = await reader_tgt.read(1)
+    debug_print(f"middleproxy_handshake: Waiting for RPC_HANDSHAKE response...")
+    try:
+        handshake_ans = await reader_tgt_phase2.read(get_to_clt_bufsize())
+    except asyncio.IncompleteReadError as e:
+        debug_print(f"middleproxy_handshake: ERROR - Server closed connection without sending response")
+        debug_print(f"middleproxy_handshake: Expected {e.expected} bytes, got {len(e.partial)}")
+        debug_print(f"middleproxy_handshake: Partial data: {e.partial.hex() if e.partial else 'NONE'}")
+        raise ConnectionAbortedError(f"server closed connection: {e}")
+    except Exception as e:
+        debug_print(f"middleproxy_handshake: ERROR reading handshake response: {type(e).__name__}: {e}")
+        raise ConnectionAbortedError(f"error reading handshake response: {e}")
+    
+    debug_print(f"middleproxy_handshake: Got RPC_HANDSHAKE response, len={len(handshake_ans)}")
+    
     if len(handshake_ans) != RPC_HANDSHAKE_ANS_LEN:
+        debug_print(f"middleproxy_handshake: ERROR - bad RPC_HANDSHAKE response length: {len(handshake_ans)}")
+        # Check if it is an error packet
+        if len(handshake_ans) >= 8:
+             ans_type = handshake_ans[:4]
+             if ans_type == b"\x08\x57\x60\xd4": # RPC_HANDSHAKE_ERROR
+                  err_code = int.from_bytes(handshake_ans[4:8], "little", signed=True)
+                  debug_print(f"middleproxy_handshake: RPC_HANDSHAKE_ERROR code={err_code}")
+                  raise ConnectionAbortedError(f"rpc handshake error {err_code}")
+
         raise ConnectionAbortedError("bad rpc handshake answer length")
 
-    handshake_type, handshake_flags, handshake_sender_pid, handshake_peer_pid = (
-        handshake_ans[:4], handshake_ans[4:8], handshake_ans[8:20], handshake_ans[20:32])
-    if handshake_type != RPC_HANDSHAKE or handshake_peer_pid != SENDER_PID:
-        raise ConnectionAbortedError("bad rpc handshake answer")
+    # Parse response: RPC_HANDSHAKE(4) + FLAGS(4) + SERVER_PID(12) + CLIENT_PID(12) = 32 bytes
+    handshake_type = handshake_ans[:4]
+    handshake_flags = handshake_ans[4:8]
+    handshake_sender_pid = handshake_ans[8:20]  # Server's PID
+    handshake_peer_pid = handshake_ans[20:32]   # Echo back of our PID
+    
+    if handshake_type != RPC_HANDSHAKE:
+        debug_print(f"middleproxy_handshake: ERROR - bad RPC_HANDSHAKE response type: {handshake_type.hex()}")
+        raise ConnectionAbortedError("bad rpc handshake response type")
+    
+    if handshake_peer_pid != SENDER_PID:
+        debug_print(f"middleproxy_handshake: ERROR - bad RPC_HANDSHAKE peer_pid: expected {SENDER_PID.hex()}, got {handshake_peer_pid.hex()}")
+        raise ConnectionAbortedError("bad rpc handshake peer_pid")
 
+    debug_print(f"middleproxy_handshake: SUCCESS! Server PID={handshake_sender_pid.hex()}")
+    
+    # Return the new reader/writer for subsequent communication
+    reader_tgt = reader_tgt_phase2
     return reader_tgt, writer_tgt, my_ip, my_port
 
 
 async def do_middleproxy_handshake(proto_tag, dc_idx, cl_ip, cl_port):
     global my_ip_info
     global tg_connection_pool
+    global middle_proxy_stack_failures
+    global middle_proxy_stack_dead_until
 
-    use_ipv6_tg = (my_ip_info["ipv6"] and (config.PREFER_IPV6 or not my_ip_info["ipv4"]))
+    debug_print(f"do_middleproxy_handshake: proto_tag={proto_tag.hex()}, dc_idx={dc_idx}, cl_ip={cl_ip}, cl_port={cl_port}")
+    debug_print(f"do_middleproxy_handshake: my_ip_info={my_ip_info}")
 
-    if use_ipv6_tg:
-        if dc_idx not in TG_MIDDLE_PROXIES_V6:
-            return False
-        addr, port = myrandom.choice(TG_MIDDLE_PROXIES_V6[dc_idx])
+    prefer_ipv6 = bool(my_ip_info["ipv6"] and (config.PREFER_IPV6 or not my_ip_info["ipv4"]))
+    debug_print(f"do_middleproxy_handshake: prefer_ipv6={prefer_ipv6}")
+
+    now = time.time()
+    proxy_addrs = []
+    if prefer_ipv6:
+        proxy_sources = (("IPv6", TG_MIDDLE_PROXIES_V6), ("IPv4", TG_MIDDLE_PROXIES_V4))
     else:
-        if dc_idx not in TG_MIDDLE_PROXIES_V4:
-            return False
-        addr, port = myrandom.choice(TG_MIDDLE_PROXIES_V4[dc_idx])
+        proxy_sources = (("IPv4", TG_MIDDLE_PROXIES_V4), ("IPv6", TG_MIDDLE_PROXIES_V6))
 
-    try:
-        ret = await tg_connection_pool.get_connection(addr, port, middleproxy_handshake)
-        reader_tgt, writer_tgt, my_ip, my_port = ret
-    except ConnectionRefusedError as E:
-        print_err("The Telegram server %d (%s %s) is refusing connections" % (dc_idx, addr, port))
+    for family, proxies in proxy_sources:
+        death_key = (dc_idx, family)
+        dead_until = middle_proxy_stack_dead_until.get(death_key, 0)
+        if config.DIFFERENT_IPSTACK_RETRY and dead_until > now:
+            debug_print(f"do_middleproxy_handshake: Skipping {family} middle proxies for dc_idx={dc_idx}, dead for {int(dead_until - now)}s")
+            continue
+        elif dead_until:
+            middle_proxy_stack_dead_until.pop(death_key, None)
+            middle_proxy_stack_failures[death_key] = 0
+
+        if family == "IPv6" and not my_ip_info["ipv6"]:
+            continue
+        if family == "IPv4" and not my_ip_info["ipv4"]:
+            continue
+        if dc_idx not in proxies:
+            debug_print(f"do_middleproxy_handshake: dc_idx {dc_idx} not in TG_MIDDLE_PROXIES_{family[-1]}")
+            continue
+
+        family_addrs = [(family, addr, port) for addr, port in proxies[dc_idx]]
+        family_addrs.sort(key=lambda _: myrandom.getrandbits(64))
+        proxy_addrs.extend(family_addrs)
+
+    if not proxy_addrs:
+        debug_print(f"do_middleproxy_handshake: ERROR - no middle proxies for dc_idx {dc_idx}")
         return False
-    except ConnectionAbortedError as E:
-        print_err("The Telegram server connection is bad: %d (%s %s) %s" % (dc_idx, addr, port, E))
-        return False
-    except (OSError, asyncio.TimeoutError) as E:
-        print_err("Unable to connect to the Telegram server %d (%s %s)" % (dc_idx, addr, port))
+
+    last_error = None
+
+    for family, addr, port in proxy_addrs:
+        debug_print(f"do_middleproxy_handshake: Connecting to {family} middle proxy {addr}:{port}")
+
+        try:
+            ret = await tg_connection_pool.get_connection(addr, port, middleproxy_handshake)
+            reader_tgt, writer_tgt, my_ip, my_port = ret
+            debug_print(f"do_middleproxy_handshake: Connection successful, my_ip={my_ip}, my_port={my_port}")
+            middle_proxy_stack_failures[(dc_idx, family)] = 0
+            middle_proxy_stack_dead_until.pop((dc_idx, family), None)
+            break
+        except ConnectionRefusedError as E:
+            last_error = E
+            debug_print(f"do_middleproxy_handshake: ConnectionRefusedError for {family} {addr}:{port}: {E}")
+            print_err("The Telegram %s middle proxy %d (%s %s) is refusing connections" % (family, dc_idx, addr, port))
+        except ConnectionAbortedError as E:
+            last_error = E
+            debug_print(f"do_middleproxy_handshake: ConnectionAbortedError for {family} {addr}:{port}: {E}")
+            print_err("The Telegram %s middle proxy connection is bad: %d (%s %s) %s" % (family, dc_idx, addr, port, E))
+        except (OSError, asyncio.TimeoutError) as E:
+            last_error = E
+            debug_print(f"do_middleproxy_handshake: OSError/TimeoutError for {family} {addr}:{port}: {type(E).__name__}: {E}")
+            print_err("Unable to connect to the Telegram %s middle proxy %d (%s %s)" % (family, dc_idx, addr, port))
+            if config.DIFFERENT_IPSTACK_RETRY:
+                failure_key = (dc_idx, family)
+                middle_proxy_stack_failures[failure_key] += 1
+                failures = middle_proxy_stack_failures[failure_key]
+                if failures >= config.DIFFERENT_IPSTACK_RETRY_THRESHOLD:
+                    dead_until = time.time() + config.MARK_DEATH_TIME
+                    middle_proxy_stack_dead_until[failure_key] = dead_until
+                    middle_proxy_stack_failures[failure_key] = 0
+                    debug_print(f"do_middleproxy_handshake: Marked {family} middle proxy stack dead for dc_idx={dc_idx} for {config.MARK_DEATH_TIME}s after {failures} failures")
+        except Exception as E:
+            last_error = E
+            debug_print(f"do_middleproxy_handshake: Unexpected exception for {family} {addr}:{port}: {type(E).__name__}: {E}")
+            import traceback
+            debug_print(traceback.format_exc())
+    else:
+        debug_print(f"do_middleproxy_handshake: all middle proxies failed for dc_idx={dc_idx}, last_error={last_error!r}")
         return False
 
     writer_tgt = ProxyReqStreamWriter(writer_tgt, cl_ip, cl_port, my_ip, my_port, proto_tag)
@@ -1640,18 +1970,25 @@ async def handle_client(reader_clt, writer_clt):
     update_user_stats(user, connects=1)
 
     connect_directly = (not config.USE_MIDDLE_PROXY or disable_middle_proxy)
+    debug_print(f"handle_client: user={user}, dc_idx={dc_idx}, proto_tag={proto_tag.hex()}, connect_directly={connect_directly}")
+    debug_print(f"handle_client: USE_MIDDLE_PROXY={config.USE_MIDDLE_PROXY}, disable_middle_proxy={disable_middle_proxy}")
+    debug_print(f"handle_client: AD_TAG={config.AD_TAG.hex() if config.AD_TAG else 'None'}, len={len(config.AD_TAG)}")
 
     if connect_directly:
+        debug_print(f"handle_client: Using direct connection")
         if config.FAST_MODE:
             tg_data = await do_direct_handshake(proto_tag, dc_idx, dec_key_and_iv=enc_key_and_iv)
         else:
             tg_data = await do_direct_handshake(proto_tag, dc_idx)
     else:
+        debug_print(f"handle_client: Using middle proxy connection")
         tg_data = await do_middleproxy_handshake(proto_tag, dc_idx, cl_ip, cl_port)
 
     if not tg_data:
+        debug_print(f"handle_client: ERROR - Failed to establish TG connection")
         return
 
+    debug_print(f"handle_client: TG connection established successfully")
     reader_tg, writer_tg = tg_data
 
     if connect_directly and config.FAST_MODE:
@@ -2048,6 +2385,36 @@ async def clear_ip_resolving_cache():
         await asyncio.sleep(myrandom.randrange(min_sleep, max_sleep))
 
 
+async def init_proxy_secret():
+    """Fetch PROXY_SECRET before accepting connections."""
+    global PROXY_SECRET
+    PROXY_SECRET_ADDR = "https://core.telegram.org/getProxySecret"
+    
+    old_secret = PROXY_SECRET[:8].hex()
+    debug_print("init_proxy_secret: Fetching latest PROXY_SECRET...")
+    debug_print(f"init_proxy_secret: Current PROXY_SECRET[0:8]={old_secret}")
+    
+    try:
+        headers, secret = await make_https_req(PROXY_SECRET_ADDR)
+        if secret and len(secret) >= 128:
+            new_secret = secret[:8].hex()
+            debug_print(f"init_proxy_secret: Fetched secret[0:8]={new_secret}, length={len(secret)}")
+            if secret != PROXY_SECRET:
+                PROXY_SECRET = secret
+                debug_print(f"init_proxy_secret: SECRET UPDATED! Old[0:8]={old_secret}, New[0:8]={new_secret}")
+                print_err(f"Middle proxy secret updated on startup: {old_secret} -> {new_secret}")
+            else:
+                debug_print("init_proxy_secret: Secret already up to date")
+                print_err(f"Middle proxy secret is current: {new_secret}")
+        else:
+            raise Exception(f"Invalid secret received (length={len(secret) if secret else 0})")
+    except Exception as E:
+        debug_print(f"init_proxy_secret: FAILED: {E}")
+        print_err(f"WARNING: Failed to fetch proxy secret on startup: {E}")
+        print_err(f"Using hardcoded PROXY_SECRET[0:8]={old_secret}")
+        print_err("This may cause connection failures with Telegram's Middle Proxies!")
+
+
 async def update_middle_proxy_info():
     async def get_new_proxies(url):
         PROXY_REGEXP = re.compile(r"proxy_for\s+(-?\d+)\s+(.+):(\d+)\s*;")
@@ -2074,6 +2441,10 @@ async def update_middle_proxy_info():
     global TG_MIDDLE_PROXIES_V6
     global PROXY_SECRET
 
+    # init_proxy_secret() 已经在 main() 中获取了最新 secret
+    debug_print("update_middle_proxy_info: Starting periodic updates...")
+    debug_print(f"update_middle_proxy_info: Current PROXY_SECRET[0:4]={PROXY_SECRET[:4].hex()}")
+    
     while True:
         try:
             v4_proxies = await get_new_proxies(PROXY_INFO_ADDR)
@@ -2095,10 +2466,15 @@ async def update_middle_proxy_info():
             headers, secret = await make_https_req(PROXY_SECRET_ADDR)
             if not secret:
                 raise Exception("no secret")
+            debug_print(f"update_middle_proxy_info: Fetched secret[0:4]={secret[:4].hex()}")
             if secret != PROXY_SECRET:
                 PROXY_SECRET = secret
+                debug_print(f"update_middle_proxy_info: UPDATED PROXY_SECRET[0:4]={PROXY_SECRET[:4].hex()}")
                 print_err("Middle proxy secret updated")
+            else:
+                debug_print("update_middle_proxy_info: Secret unchanged")
         except Exception as E:
+            debug_print(f"update_middle_proxy_info: ERROR fetching secret: {E}")
             print_err("Error updating middle proxy secret, using old", E)
 
         await asyncio.sleep(config.PROXY_INFO_UPDATE_PERIOD)
@@ -2138,6 +2514,18 @@ def init_ip_info():
         if not my_ip_info["ipv4"] and not my_ip_info["ipv6"]:
             print_err("Failed to determine your ip, advertising disabled")
             disable_middle_proxy = True
+
+    # Print debug info about configuration
+    debug_print("=" * 60)
+    debug_print("MIDDLEPROXY CONFIGURATION:")
+    debug_print(f"  USE_MIDDLE_PROXY: {config.USE_MIDDLE_PROXY}")
+    debug_print(f"  AD_TAG: {config.AD_TAG.hex() if config.AD_TAG else 'None'} (len={len(config.AD_TAG)})")
+    debug_print(f"  my_ip_info: {my_ip_info}")
+    debug_print(f"  disable_middle_proxy: {disable_middle_proxy}")
+    debug_print(f"  MODES: {config.MODES}")
+    debug_print(f"  PREFER_IPV6: {config.PREFER_IPV6}")
+    debug_print(f"  TG_CONNECT_TIMEOUT: {config.TG_CONNECT_TIMEOUT}")
+    debug_print("=" * 60)
 
 
 def print_tg_info():
@@ -2247,7 +2635,9 @@ def try_setup_uvloop():
         return
     try:
         import uvloop
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
         print_err("Found uvloop, using it for optimal performance")
     except ImportError:
         pass
@@ -2369,6 +2759,17 @@ def main():
 
     asyncio.set_event_loop(loop)
     loop.set_exception_handler(loop_exception_handler)
+
+    # 在启动服务器前先获取最新的 PROXY_SECRET
+    if config.USE_MIDDLE_PROXY:
+        debug_print("main: Initializing PROXY_SECRET before accepting connections...")
+        loop.run_until_complete(init_proxy_secret())
+        
+        # 显示当前使用的 Middle Proxy 地址
+        debug_print("main: Current Middle Proxy addresses:")
+        debug_print(f"  IPv4: {TG_MIDDLE_PROXIES_V4}")
+        debug_print(f"  IPv6: {TG_MIDDLE_PROXIES_V6}")
+        print_err(f"Middle Proxy mode enabled, PROXY_SECRET[0:8]={PROXY_SECRET[:8].hex()}")
 
     utilitary_tasks = create_utilitary_tasks(loop)
     for task in utilitary_tasks:
