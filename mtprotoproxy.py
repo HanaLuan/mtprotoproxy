@@ -112,6 +112,8 @@ mask_host_cached_ip = None
 last_clients_with_time_skew = {}
 last_clients_with_same_handshake = collections.Counter()
 proxy_start_time = 0
+proxy_process_id = 0
+proxy_process_utime = 0
 proxy_links = []
 middle_proxy_stack_failures = collections.Counter()
 middle_proxy_stack_dead_until = {}
@@ -281,6 +283,18 @@ def init_config():
 
     # delay in seconds between middle proxy info updates
     conf_dict.setdefault("PROXY_INFO_UPDATE_PERIOD", 24*60*60)
+
+    # middle proxy key mode: "psk" uses PROXY_SECRET only, "dh" negotiates an extra DH key
+    conf_dict.setdefault("MIDDLE_PROXY_KEY_MODE", "psk")
+    conf_dict["MIDDLE_PROXY_KEY_MODE"] = conf_dict["MIDDLE_PROXY_KEY_MODE"].lower()
+    if conf_dict["MIDDLE_PROXY_KEY_MODE"] not in ("psk", "dh"):
+        raise Exception("MIDDLE_PROXY_KEY_MODE must be 'psk' or 'dh'")
+
+    # middle proxy process_id mode: "random" hides the OS pid, "legacy" matches the upstream Python placeholder
+    conf_dict.setdefault("MIDDLE_PROXY_PROCESS_ID_MODE", "random")
+    conf_dict["MIDDLE_PROXY_PROCESS_ID_MODE"] = conf_dict["MIDDLE_PROXY_PROCESS_ID_MODE"].lower()
+    if conf_dict["MIDDLE_PROXY_PROCESS_ID_MODE"] not in ("random", "legacy"):
+        raise Exception("MIDDLE_PROXY_PROCESS_ID_MODE must be 'random' or 'legacy'")
 
     # if one IP stack repeatedly times out for middle proxies, temporarily try the other stack first
     conf_dict.setdefault("DIFFERENT_IPSTACK_RETRY", True)
@@ -461,7 +475,11 @@ def ensure_users_in_user_stats():
 
 def init_proxy_start_time():
     global proxy_start_time
+    global proxy_process_id
+    global proxy_process_utime
     proxy_start_time = time.time()
+    proxy_process_id = myrandom.randrange(1010, 7211)
+    proxy_process_utime = int(proxy_start_time)
 
 
 def update_stats(**kw_stats):
@@ -830,7 +848,7 @@ class MTProtoFrameStreamReader(LayeredStreamReaderBase):
 class MTProtoFrameStreamWriter(LayeredStreamWriterBase):
     __slots__ = ('seq_no', 'add_padding')
 
-    def __init__(self, upstream, seq_no=0, add_padding=False):
+    def __init__(self, upstream, seq_no=0, add_padding=True):
         self.upstream = upstream
         self.seq_no = seq_no
         self.add_padding = add_padding
@@ -1563,7 +1581,7 @@ def build_rpc_process_id(ip=None, port=0, pid=0, utime=0):
     return (
         int.to_bytes(ip_value, 4, "little") +
         int.to_bytes(port, 2, "little", signed=True) +
-        int.to_bytes(pid, 2, "little") +
+        int.to_bytes(pid & 0xffff, 2, "little") +
         int.to_bytes(utime, 4, "little", signed=True)
     )
 
@@ -1603,6 +1621,9 @@ def get_middleproxy_aes_key_and_iv(nonce_srv, nonce_clt, clt_ts, srv_ip, clt_por
 
 async def middleproxy_handshake(host, port, reader_tgt, writer_tgt):
     """ The most logic of middleproxy handshake, launched in pool """
+    global proxy_process_id
+    global proxy_process_utime
+
     debug_print(f"middleproxy_handshake: Starting handshake with {host}:{port}")
     
     START_SEQ_NO = -2
@@ -1615,20 +1636,28 @@ async def middleproxy_handshake(host, port, reader_tgt, writer_tgt):
     CRYPTO_AES = b"\x01\x00\x00\x00"
     CRYPTO_AES_DH = b"\x03\x00\x00\x00"
 
+    RPC_DH_REQ_LEN = 296
     RPC_NONCE_AES_LEN = 32
     RPC_NONCE_AES_DH_LEN = 296
     RPC_HANDSHAKE_ANS_LEN = 32
 
-    # Phase 1: RPC_NONCE - plaintext, no padding needed
-    writer_tgt = MTProtoFrameStreamWriter(writer_tgt, START_SEQ_NO, add_padding=False)
+    writer_tgt = MTProtoFrameStreamWriter(writer_tgt, START_SEQ_NO)
     key_selector = PROXY_SECRET[:4]
     crypto_ts = int.to_bytes(int(time.time()) % (256**4), 4, "little")
 
     nonce = myrandom.getrandbytes(NONCE_LEN)
     dh_private = None
 
-    msg = RPC_NONCE + key_selector + CRYPTO_AES + crypto_ts + nonce
-    debug_print(f"middleproxy_handshake: Sending RPC_NONCE AES, key_selector={key_selector.hex()}, len={len(msg)}")
+    if config.MIDDLE_PROXY_KEY_MODE == "dh":
+        dh_private, dh_public = create_rpc_dh_public_value()
+        msg = RPC_NONCE + key_selector + CRYPTO_AES_DH + crypto_ts + nonce
+        msg += int.to_bytes(0, 4, "little", signed=True)
+        msg += int.to_bytes(RPC_PARAM_HASH, 4, "little")
+        msg += dh_public
+    else:
+        msg = RPC_NONCE + key_selector + CRYPTO_AES + crypto_ts + nonce
+
+    debug_print(f"middleproxy_handshake: Sending RPC_NONCE {config.MIDDLE_PROXY_KEY_MODE}, key_selector={key_selector.hex()}, len={len(msg)}")
     debug_print(f"middleproxy_handshake: PROXY_SECRET[0:8]={PROXY_SECRET[:8].hex()}")
 
     writer_tgt.write(msg)
@@ -1675,6 +1704,9 @@ async def middleproxy_handshake(host, port, reader_tgt, writer_tgt):
         if dh_private is None:
             debug_print("middleproxy_handshake: ERROR - server returned AES_DH for non-DH nonce request")
             raise ConnectionAbortedError("unexpected rpc dh answer")
+        if len(msg) != RPC_DH_REQ_LEN:
+            debug_print(f"middleproxy_handshake: ERROR - bad AES_DH request length: {len(msg)}")
+            raise ConnectionAbortedError("bad rpc dh request length")
 
         if len(ans) != RPC_NONCE_AES_DH_LEN:
             debug_print(f"middleproxy_handshake: ERROR - AES_DH schema with bad response length: {len(ans)}")
@@ -1688,12 +1720,15 @@ async def middleproxy_handshake(host, port, reader_tgt, writer_tgt):
 
         dh_shared_key = compute_rpc_dh_shared_key(ans[40:296], dh_private)
     else:
+        if config.MIDDLE_PROXY_KEY_MODE == "dh":
+            debug_print("middleproxy_handshake: ERROR - server returned PSK response for DH request")
+            raise ConnectionAbortedError("unexpected rpc psk answer")
         if len(ans) != RPC_NONCE_AES_LEN:
             debug_print(f"middleproxy_handshake: ERROR - AES schema with bad response length: {len(ans)}")
             raise ConnectionAbortedError("bad rpc aes answer length")
         dh_shared_key = b""
     
-    debug_print(f"middleproxy_handshake: RPC_NONCE AES_DH exchange successful")
+    debug_print(f"middleproxy_handshake: RPC_NONCE {config.MIDDLE_PROXY_KEY_MODE} exchange successful")
 
     # get keys
     tg_ip, tg_port = writer_tgt.upstream.get_extra_info('peername')[:2]
@@ -1740,9 +1775,13 @@ async def middleproxy_handshake(host, port, reader_tgt, writer_tgt):
     decryptor = create_aes_cbc(key=dec_key, iv=dec_iv)
     debug_print(f"middleproxy_handshake: AES keys computed, enc_key={enc_key.hex()[:32]}...")
 
-    # Match upstream struct process_id: ip:uint32, port:int16, pid:uint16, utime:int32.
-    SENDER_PID = build_rpc_process_id(my_ip, 0, os.getpid() & 0xffff, int(time.time()))
-    PEER_PID = build_rpc_process_id(tg_ip, tg_port)
+    if config.MIDDLE_PROXY_PROCESS_ID_MODE == "legacy":
+        SENDER_PID = b"IPIPPRPDTIME"
+        PEER_PID = b"IPIPPRPDTIME"
+    else:
+        # Match upstream C struct process_id: ip:uint32, port:int16, pid:uint16, utime:int32.
+        SENDER_PID = build_rpc_process_id(my_ip, 0, proxy_process_id, proxy_process_utime)
+        PEER_PID = build_rpc_process_id(tg_ip, tg_port)
 
     # Phase 2: RPC_HANDSHAKE - encrypted, padding required
     handshake = RPC_HANDSHAKE + RPC_FLAGS + SENDER_PID + PEER_PID
